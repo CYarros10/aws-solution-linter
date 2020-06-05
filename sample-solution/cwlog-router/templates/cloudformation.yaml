@@ -1,0 +1,167 @@
+---
+AWSTemplateFormatVersion: 2010-09-09
+Description: >
+  Automatically route CloudWatch logs to a logging account
+  Kinesis stream by adding tags.
+
+Parameters:
+
+  # pBucketNameCodeArtifacts:
+  #   Type: String
+  #   Description: bucket containing the lambda code / zip artifact
+
+  pSubFilterName:
+    Type: String
+    Description: >
+      name of the filter for your cloudwatch log group.
+      include account_id, region, app_name, etc.
+
+  pTagKey:
+    Type: String
+    Description: >
+      the tag key that identifies which cloudwatch log groups
+      to route to firehose delivery stream
+
+  pTagValue:
+    Type: String
+    Description: >
+      the tag value that identifies which cloudwatch log groups
+      to route to firehose delivery stream
+
+  pDestinationArn:
+    Type: String
+    Description: the arn of the log destination in the receiver account
+
+  pDestinationAccountID:
+    Type: String
+    Description: id of the destination account containing the kinesis stream
+
+
+Resources:
+
+  # --------------------------------------------------
+  # Resources: IAM Policy
+  # --------------------------------------------------
+
+  rCWLtoCrossAccountKinesisRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: ''
+            Effect: Allow
+            Principal:
+              Service: logs.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Path: /
+
+  rCWLtoCrossAccountKinesisPolicy:
+    Type: "AWS::IAM::ManagedPolicy"
+    Properties:
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'kinesis:PutRecord'
+            Resource: !Ref pDestinationArn
+          - Effect: Allow
+            Action: 'iam:PassRole'
+            Resource: !GetAtt rCWLtoCrossAccountKinesisRole.Arn
+      Roles:
+        - !Ref rCWLtoCrossAccountKinesisRole
+
+  # --------------------------------------------------
+  # Resources: Lambda
+  # --------------------------------------------------
+
+  rLambdaCWLRoutingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+
+  rLambdaCWLRoutingPolicy:
+    Type: "AWS::IAM::ManagedPolicy"
+    Properties:
+      Roles:
+        - !Ref rLambdaCWLRoutingRole
+      PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - 'logs:CreateLogGroup'
+                - 'logs:CreateLogStream'
+                - 'logs:PutLogEvents'
+                - 'logs:DescribeLogStreams'
+                - 'logs:DescribeLogGroups'
+                - 'logs:DescribeSubscriptionFilters'
+                - 'logs:putSubscriptionFilter'
+                - 'logs:deleteSubscriptionFilter'
+              Resource: 'arn:aws:logs:*:*:*'
+            - Effect: Allow
+              Action:
+                - 'iam:PassRole'
+              Resource: !GetAtt rCWLtoCrossAccountKinesisRole.Arn
+
+  rLambdaCWLRouting:
+    Type: AWS::Lambda::Function
+    DependsOn: [rLambdaCWLRoutingPolicy,rCWLtoCrossAccountKinesisPolicy]
+    Properties:
+      Code: {}
+      Timeout: 60
+      MemorySize: 128
+      Description: >
+        route cloudwatch log groups to a kinesis firehose based on tags
+      FunctionName: cwl_routing
+      Handler: cwl_routing.lambda_handler
+      Role: !GetAtt rLambdaCWLRoutingRole.Arn
+      Runtime: python3.7
+      Environment:
+        Variables:
+          SUB_FILTER_NAME: !Ref pSubFilterName
+          SUB_DEST_ARN: !Ref pDestinationArn
+          SUB_ACCOUNT_ID_DESTINATION: !Ref pDestinationAccountID
+          SUB_ROLE_ARN: !GetAtt rCWLtoCrossAccountKinesisRole.Arn
+          TAG_KEY: !Ref pTagKey
+          TAG_VALUE: !Ref pTagValue
+
+  # --------------------------------------------------
+  # Resources: Cloudwatch Events Rule
+  # --------------------------------------------------
+
+  rEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: "EventRule - Tag Change on Resource"
+      EventPattern:
+        source:
+          - "aws.tag"
+        detail-type:
+          - "Tag Change on Resource"
+        detail:
+          resource-type:
+            - "log-group"
+      State: "ENABLED"
+      Targets:
+        -
+          Arn: !GetAtt rLambdaCWLRouting.Arn
+          Id: 'test_id'
+
+  rPermissionForEventsToInvokeLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref rLambdaCWLRouting
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt rEventRule.Arn
